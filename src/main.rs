@@ -1,4 +1,5 @@
 use core::mem::MaybeUninit;
+use std::hash::{DefaultHasher, Hash};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(i32)]
@@ -97,7 +98,7 @@ trait ZlibImplementation {
 
     fn set_out_raw<T>(strm: &mut Self::Stream, ptr: *const T, len: usize);
 
-    fn set_out(strm: &mut Self::Stream, output: &[MaybeUninit<u8>]) {
+    fn set_out(strm: &mut Self::Stream, output: &[u8]) {
         Self::set_out_raw(strm, output.as_ptr(), output.len())
     }
 
@@ -111,13 +112,13 @@ trait DeflateImplementation {
     const NAME: &'static str;
 
     fn uncompress_slice<'a>(
-        output: &'a mut [MaybeUninit<u8>],
+        output: &'a mut [u8],
         input: &[u8],
         config: InflateConfig,
     ) -> (&'a mut [u8], ReturnCode);
 
     fn compress_slice<'a>(
-        output: &'a mut [MaybeUninit<u8>],
+        output: &'a mut [u8],
         input: &[u8],
         config: DeflateConfig,
     ) -> (&'a mut [u8], ReturnCode);
@@ -127,7 +128,7 @@ impl<T: ZlibImplementation> DeflateImplementation for T {
     const NAME: &'static str = <T as ZlibImplementation>::NAME;
 
     fn uncompress_slice<'a>(
-        output: &'a mut [MaybeUninit<u8>],
+        output: &'a mut [u8],
         input: &[u8],
         config: InflateConfig,
     ) -> (&'a mut [u8], ReturnCode) {
@@ -207,7 +208,7 @@ impl<T: ZlibImplementation> DeflateImplementation for T {
     }
 
     fn compress_slice<'a>(
-        output: &'a mut [MaybeUninit<u8>],
+        output: &'a mut [u8],
         input: &[u8],
         config: DeflateConfig,
     ) -> (&'a mut [u8], ReturnCode) {
@@ -220,8 +221,8 @@ impl<T: ZlibImplementation> DeflateImplementation for T {
 
         let stream = unsafe { stream.assume_init_mut() };
 
-        Self::set_in(stream, input);
-        Self::set_out(stream, output);
+        Self::set_in(stream, &input[..0]);
+        Self::set_out(stream, &output[..0]);
 
         let max = core::ffi::c_uint::MAX as usize;
 
@@ -560,7 +561,7 @@ impl DeflateImplementation for MinizOxide {
     const NAME: &'static str = "miniz-oxide";
 
     fn uncompress_slice<'a>(
-        output: &'a mut [MaybeUninit<u8>],
+        output: &'a mut [u8],
         input: &[u8],
         _config: InflateConfig,
     ) -> (&'a mut [u8], ReturnCode) {
@@ -597,14 +598,10 @@ impl DeflateImplementation for MinizOxide {
     }
 
     fn compress_slice<'a>(
-        output: &'a mut [MaybeUninit<u8>],
+        mut output: &'a mut [u8],
         mut input: &[u8],
         config: DeflateConfig,
     ) -> (&'a mut [u8], ReturnCode) {
-        let mut output = unsafe {
-            core::slice::from_raw_parts_mut(output.as_mut_ptr().cast::<u8>(), output.len())
-        };
-
         // The comp flags function sets the zlib flag if the window_bits parameter is > 0.
         let flags = miniz_oxide::deflate::core::create_comp_flags_from_zip_params(
             config.level.into(),
@@ -658,6 +655,17 @@ fn main() {
     let mode = match it.next().unwrap().as_str() {
         "inflate" => Mode::Inflate,
         "deflate" => Mode::Deflate,
+        "deflate-all" => {
+            let level = it.next().unwrap().parse().unwrap();
+            let path = it.next().unwrap();
+
+            return deflate_all(&path, level);
+        }
+        "inflate-all" => {
+            let path = it.next().unwrap();
+
+            return inflate_all(&path);
+        }
         other => panic!("invalid mode {other:?}"),
     };
 
@@ -680,20 +688,24 @@ fn main() {
 }
 
 fn helper<T: DeflateImplementation>(mode: Mode, path: &str, level: i32) {
-    let mut output = vec![MaybeUninit::new(0u8); 1 << 28];
+    let mut output = vec![0; 1 << 28];
     let Ok(input) = std::fs::read(path) else {
         panic!("error opening {path:?}")
     };
 
-    println!(
-        "performing {mode:?} at level {level} using method {}",
-        T::NAME
-    );
+    // println!( "performing {mode:?} at level {level} using method {}", T::NAME);
+
+    let mut hasher = DefaultHasher::new();
+    use std::hash::Hasher;
 
     match mode {
         Mode::Inflate => {
             let config = InflateConfig { window_bits: 15 };
-            T::uncompress_slice(&mut output, &input, config);
+            let (output, res) = T::uncompress_slice(&mut output, &input, config);
+            assert_eq!(res, ReturnCode::Ok);
+
+            output.hash(&mut hasher);
+            assert_eq!(hasher.finish(), 15127115900574662295);
         }
         Mode::Deflate => {
             let config = DeflateConfig {
@@ -703,7 +715,71 @@ fn helper<T: DeflateImplementation>(mode: Mode, path: &str, level: i32) {
                 mem_level: 8,
                 strategy: Strategy::Default,
             };
-            T::compress_slice(&mut output, &input, config);
+            let (output, res) = T::compress_slice(&mut output, &input, config);
+            assert_eq!(res, ReturnCode::Ok);
+
+            output.hash(&mut hasher);
+            // dbg!(hasher.finish());
         }
+    }
+}
+
+const FUNCTIONS: [(&str, fn(Mode, &str, i32)); 5] = [
+    ("og", helper::<ZlibOg> as _),
+    ("ng", helper::<ZlibNg> as _),
+    ("rs", helper::<ZlibRs> as _),
+    ("cloudflare", helper::<ZlibCloudflare> as _),
+    ("miniz", helper::<MinizOxide> as _),
+];
+
+fn deflate_all(path: &str, level: i32) {
+    let n = 5;
+
+    let mut results = Vec::new();
+
+    for (name, f) in FUNCTIONS {
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            f(Mode::Deflate, path, level);
+        }
+        let end = std::time::Instant::now();
+
+        let delta = end.duration_since(start);
+
+        results.push((name, delta));
+    }
+
+    let bytes = std::fs::metadata(path).unwrap().len();
+    let mbs = (n * bytes) as f64 / 1_000_000.0;
+
+    println!("implementation, MB/s");
+    for (name, delta) in results {
+        println!("{name}, {}", mbs / delta.as_secs_f64());
+    }
+}
+
+fn inflate_all(path: &str) {
+    let n = 5;
+
+    let mut results = Vec::new();
+
+    for (name, f) in FUNCTIONS {
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            f(Mode::Inflate, path, 0);
+        }
+        let end = std::time::Instant::now();
+
+        let delta = end.duration_since(start);
+
+        results.push((name, delta));
+    }
+
+    let bytes = std::fs::metadata(path).unwrap().len();
+    let mbs = (n * bytes) as f64 / 1_000_000.0;
+
+    println!("implementation, MB/s");
+    for (name, delta) in results {
+        println!("{name}, {}", mbs / delta.as_secs_f64());
     }
 }
